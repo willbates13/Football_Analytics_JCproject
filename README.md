@@ -1,10 +1,24 @@
-# Football Analytics Markov Model Demo
+# StatsBomb 360 Markov Chain Visualiser
 
-This repository contains a single-script demo that downloads StatsBomb's open
-data and builds a Markov chain model inspired by Ian Graham's possession value
-work. The refreshed version adds higher-resolution pitch grids, goal markers,
-support-context modelling from StatsBomb 360 freeze frames and additional
-visualisations for presentations (interactive and static).
+This repository keeps everything in a single Python script that pulls directly
+from [StatsBomb's open data](https://github.com/statsbomb/open-data) and builds a
+transparent Markov decision process (MDP) style value model. Every state uses
+StatsBomb 360 freeze-frame player locations so you can literally watch the value
+surface emerge event by event.
+
+## What the script does
+
+* downloads competitions, matches and events until it finds ones with StatsBomb
+  360 freeze frames (no other data sources are used)
+* builds a pitch grid and initialises the value function at zero
+* treats each freeze-framed event as a state whose features are the teammate and
+  opponent locations plus the ball position
+* updates the value grid sequentially with a temporal-difference rule so you can
+  step through the creation of the Markov value model
+* draws every player and the ball on a stylised pitch alongside the evolving
+  value surface
+* saves the result as a Plotly HTML animation where you can scrub through or
+  autoplay the match
 
 ## Quick start
 
@@ -12,48 +26,27 @@ visualisations for presentations (interactive and static).
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python markov_value_model.py --max-matches 20
+python markov_value_model.py --max-matches 10
 ```
 
-The script saves multiple outputs by default:
+The script prints the path to the generated HTML file (default
+`three_sixty_markov.html`). Open it in a browser to step through each event.
 
-* `value_model.html` – interactive Plotly heatmap of state/action values.
-* `value_model.png` – static Matplotlib summary of key value surfaces.
-* `support_value.html` – contextual model that folds StatsBomb 360 player
-  positions into the state (falls back gracefully if freeze frames are
-  unavailable).
-* `ball_progression.png` – quiver plot describing average pass/carry movement.
-* `shot_quality.html` – heatmap of goal probability by shot distance/angle.
+## Useful command-line options
 
-### Command line options
+* `--list` – show the matches (within the search limits) that include 360 data
+  and exit
+* `--match-id` – render a specific match that is known to have StatsBomb 360
+  freeze frames
+* `--competition-id` / `--season-id` – filter the search to a particular
+  competition and season
+* `--max-matches` – limit how many matches are checked for 360 data (default 5)
+* `--grid-x` / `--grid-y` – control the pitch discretisation used for the value
+  function
+* `--gamma` / `--alpha` – tweak the temporal-difference discount factor and
+  learning rate
+* `--output` – choose a different HTML file name
 
-* `--competition` – StatsBomb competition ID (default: `43`, 2018 World Cup).
-* `--season` – Season ID for the chosen competition (default: `3`).
-* `--max-matches` – Limit the number of matches downloaded to keep the example
-  lightweight.
-* `--output` – Path to write the interactive Plotly HTML file.
-* `--static-output` – File path for the static Matplotlib summary.
-* `--support-output` – Where to save the support-context HTML visualisation.
-* `--progression-output` – Output path for the quiver plot.
-* `--shot-output` – File path for the shot quality heatmap.
-
-The dropdown menu in the interactive figure includes:
-
-* **State Value** – probability of scoring before the possession ends from each
-  zone (the Ian Graham-style possession value).
-* **Discounted Value** – an RL-inspired variant with a discount factor that
-  emphasises quicker scoring opportunities.
-* **Action Value** heatmaps – expected goal value if a possession chooses a
-  specific action (pass, carry, shot, etc.) from each zone.
-* **Action Advantage** heatmaps – the improvement over the average action in
-  that zone, analogous to an RL advantage function.
-
-The support-context visualisation groups states by the on-ball player's help:
-isolated versus supported, pressure levels and whether a progressive passing
-lane exists. These states are derived from StatsBomb 360 freeze frames, so the
-plot only appears for competitions where those data are available.
-
-The static PNG and quiver plot add presentation-friendly slides for exploring
-action values and ball movement without relying on interactive controls. The
-shot quality heatmap complements the possession model by answering "what kinds
-of shots score most often?" in terms of distance and shooting angle.
+Because the animation is driven entirely by StatsBomb 360 freeze frames, some
+competitions will not appear unless they have that extra contextual data. Use
+`--list` to confirm availability before rendering.
