@@ -124,6 +124,7 @@ class FreezeFrameRecord:
     team_id: Optional[int]
     team_name: Optional[str]
     side: Optional[str]
+    jersey_number: Optional[int]
     x: Optional[float]
     y: Optional[float]
     teammate: bool
@@ -304,6 +305,39 @@ def orient_visible_area(
     return oriented
 
 
+def infer_home_orientation(
+    freeze_by_event: Dict[str, dict], players: Dict[int, PlayerInfo]
+) -> bool:
+    """Return True if the home team already occupies the left side of the pitch."""
+
+    for freeze_entry in freeze_by_event.values():
+        freeze_frame = freeze_entry.get("freeze_frame") or []
+        if not freeze_frame:
+            continue
+        home_samples: List[float] = []
+        away_samples: List[float] = []
+        for player in freeze_frame:
+            player_info = player.get("player") or {}
+            player_id = player_info.get("id")
+            if player_id is None:
+                continue
+            info = players.get(player_id)
+            if info is None:
+                continue
+            location = player.get("location") or []
+            if len(location) < 2 or location[0] is None:
+                continue
+            if info.side == "home":
+                home_samples.append(float(location[0]))
+            elif info.side == "away":
+                away_samples.append(float(location[0]))
+        if home_samples and away_samples:
+            home_mean = sum(home_samples) / len(home_samples)
+            away_mean = sum(away_samples) / len(away_samples)
+            return home_mean <= away_mean
+    return True
+
+
 def compute_event_detail(event: dict) -> Tuple[Optional[str], Optional[str]]:
     event_type = event.get("type", {}).get("name")
     detail = None
@@ -356,6 +390,7 @@ def process_events(
     freeze_by_event: Dict[str, dict],
     players: Dict[int, PlayerInfo],
     teams: Dict[int, TeamInfo],
+    flip_orientation: bool,
 ) -> Tuple[List[EventRecord], List[FreezeFrameRecord], List[ShotRecord]]:
     events: List[EventRecord] = []
     freeze_records: List[FreezeFrameRecord] = []
@@ -392,6 +427,11 @@ def process_events(
         carry_end_location = normalise_location(event.get("carry", {}).get("end_location"))
         shot_end_location = normalise_location(event.get("shot", {}).get("end_location"))
 
+        oriented_location = orient_location(location, flip_orientation)
+        oriented_end_location = orient_location(end_location, flip_orientation)
+        oriented_carry_end = orient_location(carry_end_location, flip_orientation)
+        oriented_shot_end = orient_location(shot_end_location, flip_orientation)
+
         shot_info = event.get("shot")
         shot_xg = float(shot_info.get("statsbomb_xg", 0.0)) if shot_info else 0.0
         shot_outcome = shot_info.get("outcome", {}).get("name") if shot_info else None
@@ -415,8 +455,8 @@ def process_events(
                 ShotRecord(
                     minute=minute,
                     second=second,
-                    x=location[0],
-                    y=location[1],
+                    x=oriented_location[0],
+                    y=oriented_location[1],
                     xg=shot_xg,
                     outcome=shot_outcome or "Unknown",
                     goal=is_goal,
@@ -426,6 +466,9 @@ def process_events(
 
         possession_team_id = event.get("possession_team", {}).get("id")
         possession_team_name = event.get("possession_team", {}).get("name")
+        if possession_team_id is None and team_id is not None:
+            possession_team_id = team_id
+            possession_team_name = team_name
         possession_change = False
         possession_from = previous_possession_team
         possession_to = possession_team_id
@@ -433,13 +476,8 @@ def process_events(
             possession_change = previous_possession_team is not None
             previous_possession_team = possession_team_id
 
-        possession_team_info = teams.get(possession_team_id) if possession_team_id else None
-        if possession_team_info is None:
-            possession_team_info = team_info
-        freeze_needs_flip = bool(possession_team_info and possession_team_info.side == "away")
-
         raw_visible_area = freeze_by_event.get(event_uuid, {}).get("visible_area")
-        visible_area = orient_visible_area(raw_visible_area, freeze_needs_flip)
+        visible_area = orient_visible_area(raw_visible_area, flip_orientation)
 
         record = EventRecord(
             index=index,
@@ -460,10 +498,10 @@ def process_events(
             possession_change=possession_change,
             possession_from=possession_from,
             possession_to=possession_to,
-            location=location,
-            end_location=end_location,
-            carry_end_location=carry_end_location,
-            shot_end_location=shot_end_location,
+            location=oriented_location,
+            end_location=oriented_end_location,
+            carry_end_location=oriented_carry_end,
+            shot_end_location=oriented_shot_end,
             shot_xg=shot_xg,
             shot_outcome=shot_outcome,
             is_goal=is_goal,
@@ -486,9 +524,7 @@ def process_events(
             player_id_ff = player_entry.get("id")
             info = players.get(player_id_ff)
             raw_location = player.get("location") or [None, None]
-            location = orient_location(
-                (raw_location[0], raw_location[1]), freeze_needs_flip
-            )
+            location = orient_location((raw_location[0], raw_location[1]), flip_orientation)
             freeze_records.append(
                 FreezeFrameRecord(
                     event_uuid=event_uuid,
@@ -497,6 +533,7 @@ def process_events(
                     team_id=info.team_id if info else None,
                     team_name=info.team_name if info else None,
                     side=info.side if info else None,
+                    jersey_number=info.jersey_number if info else None,
                     x=location[0],
                     y=location[1],
                     teammate=bool(player.get("teammate")),
@@ -673,17 +710,21 @@ def split_freeze_players(
 ) -> Tuple[go.Scatter, go.Scatter]:
     home_x: List[Optional[float]] = []
     home_y: List[Optional[float]] = []
-    home_text: List[str] = []
+    home_numbers: List[str] = []
     home_sizes: List[float] = []
     home_line_colors: List[str] = []
     home_line_widths: List[float] = []
+    home_hover: List[str] = []
+    home_symbols: List[str] = []
 
     away_x: List[Optional[float]] = []
     away_y: List[Optional[float]] = []
-    away_text: List[str] = []
+    away_numbers: List[str] = []
     away_sizes: List[float] = []
     away_line_colors: List[str] = []
     away_line_widths: List[float] = []
+    away_hover: List[str] = []
+    away_symbols: List[str] = []
 
     for player in freeze_entry:
         text = player.player_name or "Unknown"
@@ -693,55 +734,77 @@ def split_freeze_players(
             label = text
             if player.keeper:
                 label = f"{label} (GK)"
-            home_text.append(label)
+            jersey = str(player.jersey_number) if player.jersey_number is not None else ""
+            if player.actor and not jersey:
+                jersey = "★"
+            if not jersey and player.player_name:
+                jersey = player.player_name.split()[-1][:2].upper()
+            home_numbers.append(jersey)
+            home_hover.append(label)
             size = 22 if player.actor else 16
             line_color = "#ffd700" if player.actor else "white"
             home_sizes.append(size)
             home_line_colors.append(line_color)
             home_line_widths.append(3 if player.actor else 1.5)
+            symbol = "star" if player.actor else ("hexagon" if player.keeper else "circle")
+            home_symbols.append(symbol)
         elif player.side == "away":
             away_x.append(player.x)
             away_y.append(player.y)
             label = text
             if player.keeper:
                 label = f"{label} (GK)"
-            away_text.append(label)
+            jersey = str(player.jersey_number) if player.jersey_number is not None else ""
+            if player.actor and not jersey:
+                jersey = "★"
+            if not jersey and player.player_name:
+                jersey = player.player_name.split()[-1][:2].upper()
+            away_numbers.append(jersey)
+            away_hover.append(label)
             size = 22 if player.actor else 16
             line_color = "#ffd700" if player.actor else "white"
             away_sizes.append(size)
             away_line_colors.append(line_color)
             away_line_widths.append(3 if player.actor else 1.5)
+            symbol = "star" if player.actor else ("hexagon" if player.keeper else "circle")
+            away_symbols.append(symbol)
 
     home_trace = go.Scatter(
         x=home_x,
         y=home_y,
-        mode="markers",
+        mode="markers+text",
         marker=dict(
             color=home_color,
             size=home_sizes,
-            symbol="circle",
+            symbol=home_symbols if home_symbols else "circle",
             line=dict(color=home_line_colors, width=home_line_widths),
             opacity=0.95,
         ),
-        text=home_text,
+        text=home_numbers,
+        textposition="middle center",
+        textfont=dict(color="white", size=11, family="DejaVu Sans"),
+        hovertext=home_hover,
         name="Home team",
-        hovertemplate="%{text}<extra></extra>",
+        hovertemplate="%{hovertext}<extra></extra>",
         showlegend=False,
     )
     away_trace = go.Scatter(
         x=away_x,
         y=away_y,
-        mode="markers",
+        mode="markers+text",
         marker=dict(
             color=away_color,
             size=away_sizes,
-            symbol="circle",
+            symbol=away_symbols if away_symbols else "circle",
             line=dict(color=away_line_colors, width=away_line_widths),
             opacity=0.95,
         ),
-        text=away_text,
+        text=away_numbers,
+        textposition="middle center",
+        textfont=dict(color="white", size=11, family="DejaVu Sans"),
+        hovertext=away_hover,
         name="Away team",
-        hovertemplate="%{text}<extra></extra>",
+        hovertemplate="%{hovertext}<extra></extra>",
         showlegend=False,
     )
     return home_trace, away_trace
@@ -1100,7 +1163,7 @@ def build_replay_figure(
 
     fig.frames = frames
     frame_names = [frame.name for frame in frames]
-    default_frame_duration = 420
+    default_frame_duration = 260
 
     fig.update_layout(
         width=1320,
@@ -1110,8 +1173,9 @@ def build_replay_figure(
         plot_bgcolor="#0b6623",
         paper_bgcolor="#123524",
         font=dict(color="white"),
+        hovermode="closest",
         margin=dict(l=40, r=40, t=80, b=40),
-        transition=dict(duration=default_frame_duration, easing="linear"),
+        transition=dict(duration=default_frame_duration, easing="quad-in-out"),
         sliders=[
             dict(
                 active=0,
@@ -1120,7 +1184,7 @@ def build_replay_figure(
                 steps=slider_steps,
                 x=0.1,
                 len=0.75,
-                transition=dict(duration=200, easing="linear"),
+                transition=dict(duration=200, easing="quad-in-out"),
             )
         ],
         updatemenus=[
@@ -1135,7 +1199,7 @@ def build_replay_figure(
                             frame_names,
                             {
                                 "frame": {"duration": default_frame_duration * 2, "redraw": True},
-                                "transition": {"duration": default_frame_duration * 2, "easing": "linear"},
+                                "transition": {"duration": default_frame_duration * 2, "easing": "quad-in-out"},
                                 "fromcurrent": True,
                                 "mode": "immediate",
                             },
@@ -1148,7 +1212,7 @@ def build_replay_figure(
                             frame_names,
                             {
                                 "frame": {"duration": default_frame_duration, "redraw": True},
-                                "transition": {"duration": default_frame_duration, "easing": "linear"},
+                                "transition": {"duration": default_frame_duration, "easing": "quad-in-out"},
                                 "fromcurrent": True,
                                 "mode": "immediate",
                             },
@@ -1161,7 +1225,7 @@ def build_replay_figure(
                             frame_names,
                             {
                                 "frame": {"duration": max(120, default_frame_duration // 2), "redraw": True},
-                                "transition": {"duration": max(120, default_frame_duration // 2), "easing": "linear"},
+                                "transition": {"duration": max(120, default_frame_duration // 2), "easing": "quad-in-out"},
                                 "fromcurrent": True,
                                 "mode": "immediate",
                             },
@@ -1350,7 +1414,14 @@ def main() -> None:
     teams = build_team_directory(match_info)
     players = build_player_directory(lineups, teams)
     freeze_lookup = freeze_frames_by_event(freeze_data)
-    events, freeze_frames, shots = process_events(events_data, freeze_lookup, players, teams)
+    home_already_left = infer_home_orientation(freeze_lookup, players)
+    events, freeze_frames, shots = process_events(
+        events_data,
+        freeze_lookup,
+        players,
+        teams,
+        flip_orientation=not home_already_left,
+    )
 
     manager.save_processed_dataset(args.match_id, events, freeze_frames)
 
