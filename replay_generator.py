@@ -36,6 +36,9 @@ GITHUB_API_THREE_SIXTY = (
     "https://api.github.com/repos/statsbomb/open-data/contents/data/three-sixty"
 )
 
+PITCH_LENGTH = 120.0
+PITCH_WIDTH = 80.0
+
 
 @dataclass
 class TeamInfo:
@@ -273,6 +276,34 @@ def normalise_location(value: Optional[Iterable[Optional[float]]]) -> Tuple[Opti
     return (coords[0], coords[1])
 
 
+def orient_location(
+    location: Tuple[Optional[float], Optional[float]], flip: bool
+) -> Tuple[Optional[float], Optional[float]]:
+    if not flip:
+        return location
+    x, y = location
+    oriented_x = PITCH_LENGTH - x if x is not None else None
+    oriented_y = PITCH_WIDTH - y if y is not None else None
+    return (oriented_x, oriented_y)
+
+
+def orient_visible_area(
+    visible_area: Optional[List[float]], flip: bool
+) -> Optional[List[float]]:
+    if not visible_area or not flip:
+        return visible_area
+    oriented: List[float] = []
+    for idx, value in enumerate(visible_area):
+        if value is None:
+            oriented.append(value)
+            continue
+        if idx % 2 == 0:
+            oriented.append(PITCH_LENGTH - value)
+        else:
+            oriented.append(PITCH_WIDTH - value)
+    return oriented
+
+
 def compute_event_detail(event: dict) -> Tuple[Optional[str], Optional[str]]:
     event_type = event.get("type", {}).get("name")
     detail = None
@@ -402,6 +433,14 @@ def process_events(
             possession_change = previous_possession_team is not None
             previous_possession_team = possession_team_id
 
+        possession_team_info = teams.get(possession_team_id) if possession_team_id else None
+        if possession_team_info is None:
+            possession_team_info = team_info
+        freeze_needs_flip = bool(possession_team_info and possession_team_info.side == "away")
+
+        raw_visible_area = freeze_by_event.get(event_uuid, {}).get("visible_area")
+        visible_area = orient_visible_area(raw_visible_area, freeze_needs_flip)
+
         record = EventRecord(
             index=index,
             event_uuid=event_uuid,
@@ -437,7 +476,7 @@ def process_events(
             xg_home=xg_home,
             xg_away=xg_away,
             period=int(event.get("period", 1)),
-            visible_area=freeze_by_event.get(event_uuid, {}).get("visible_area"),
+            visible_area=visible_area,
         )
         events.append(record)
 
@@ -446,6 +485,10 @@ def process_events(
             player_entry = player.get("player") or {}
             player_id_ff = player_entry.get("id")
             info = players.get(player_id_ff)
+            raw_location = player.get("location") or [None, None]
+            location = orient_location(
+                (raw_location[0], raw_location[1]), freeze_needs_flip
+            )
             freeze_records.append(
                 FreezeFrameRecord(
                     event_uuid=event_uuid,
@@ -454,12 +497,8 @@ def process_events(
                     team_id=info.team_id if info else None,
                     team_name=info.team_name if info else None,
                     side=info.side if info else None,
-                    x=player.get("location", [None, None])[0]
-                    if player.get("location")
-                    else None,
-                    y=player.get("location", [None, None])[1]
-                    if player.get("location")
-                    else None,
+                    x=location[0],
+                    y=location[1],
                     teammate=bool(player.get("teammate")),
                     actor=bool(player.get("actor")),
                     keeper=bool(player.get("keeper")),
@@ -680,7 +719,9 @@ def split_freeze_players(
         marker=dict(
             color=home_color,
             size=home_sizes,
+            symbol="circle",
             line=dict(color=home_line_colors, width=home_line_widths),
+            opacity=0.95,
         ),
         text=home_text,
         name="Home team",
@@ -694,7 +735,9 @@ def split_freeze_players(
         marker=dict(
             color=away_color,
             size=away_sizes,
+            symbol="circle",
             line=dict(color=away_line_colors, width=away_line_widths),
+            opacity=0.95,
         ),
         text=away_text,
         name="Away team",
@@ -830,14 +873,28 @@ def build_replay_figure(
     home_players, away_players = split_freeze_players(first_freeze, home_color, away_color)
     ball_position = infer_ball_position(first_event, first_freeze)
 
+    dynamic_trace_indices: List[int] = []
+
+    home_trace_index = len(fig.data)
     fig.add_trace(home_players, row=1, col=1)
+    dynamic_trace_indices.append(home_trace_index)
+
+    away_trace_index = len(fig.data)
     fig.add_trace(away_players, row=1, col=1)
+    dynamic_trace_indices.append(away_trace_index)
+
+    ball_trace_index = len(fig.data)
     fig.add_trace(
         go.Scatter(
             x=[ball_position[0]] if ball_position[0] is not None else [None],
             y=[ball_position[1]] if ball_position[1] is not None else [None],
             mode="markers",
-            marker=dict(color="#fefefe", size=16, line=dict(color="black", width=2)),
+            marker=dict(
+                color="#fefefe",
+                size=16,
+                line=dict(color="black", width=2),
+                symbol="circle",
+            ),
             name="Ball",
             hoverinfo="skip",
             showlegend=False,
@@ -845,47 +902,107 @@ def build_replay_figure(
         row=1,
         col=1,
     )
+    dynamic_trace_indices.append(ball_trace_index)
+
+    event_text_index = len(fig.data)
     fig.add_trace(
         go.Scatter(
             x=[60],
-            y=[-5],
+            y=[-2],
             mode="text",
             text=[build_event_summary(first_event, teams)],
             textfont=dict(color="white", size=14),
+            textposition="top center",
             showlegend=False,
             hoverinfo="none",
         ),
         row=1,
         col=1,
     )
+    dynamic_trace_indices.append(event_text_index)
+
+    scoreboard_text_index = len(fig.data)
     fig.add_trace(
         go.Scatter(
-            x=[0],
-            y=[0],
+            x=[0.05],
+            y=[0.9],
             mode="text",
             text=[build_scoreboard_text(first_event, teams)],
-            textfont=dict(color="white", size=14),
+            textfont=dict(color="white", size=15),
+            textposition="top left",
             showlegend=False,
             hoverinfo="none",
         ),
         row=1,
         col=2,
     )
+    dynamic_trace_indices.append(scoreboard_text_index)
+
+    timeline_marker_index = len(fig.data)
     fig.add_trace(
         go.Scatter(
             x=[first_event.match_time_minutes],
             y=[0],
             mode="markers",
-            marker=dict(color="#ffff00", size=20, symbol="line-ns-open"),
+            marker=dict(color="#ffff00", size=18, symbol="line-ns-open"),
             showlegend=False,
             hoverinfo="skip",
         ),
         row=2,
         col=1,
     )
+    dynamic_trace_indices.append(timeline_marker_index)
 
-    fig.update_xaxes(range=[-1, 1], visible=False, row=1, col=2)
-    fig.update_yaxes(range=[-1, 1], visible=False, row=1, col=2)
+    shot_highlight_index = len(fig.data)
+    has_initial_shot = (
+        first_event.event_type == "Shot"
+        and first_event.location != (None, None)
+        and first_event.shot_end_location != (None, None)
+    )
+    if not has_initial_shot:
+        shot_x = [None]
+        shot_y = [None]
+        shot_line_color = "rgba(0,0,0,0)"
+    else:
+        shot_x = [first_event.location[0], first_event.shot_end_location[0]]
+        shot_y = [first_event.location[1], first_event.shot_end_location[1]]
+        shot_line_color = "#ffd700" if first_event.is_goal else "#ffffaa"
+    fig.add_trace(
+        go.Scatter(
+            x=shot_x,
+            y=shot_y,
+            mode="lines+markers",
+            line=dict(color=shot_line_color, width=3, dash="dot"),
+            marker=dict(
+                color=shot_line_color,
+                size=10,
+                symbol="circle-open",
+                line=dict(color=shot_line_color, width=2),
+            ),
+            hoverinfo="skip",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    dynamic_trace_indices.append(shot_highlight_index)
+
+    fig.update_xaxes(range=[0, 1], visible=False, row=1, col=2)
+    fig.update_yaxes(range=[0, 1], visible=False, row=1, col=2)
+    fig.add_shape(
+        type="rect",
+        x0=0,
+        y0=0,
+        x1=1,
+        y1=1,
+        xref="x2",
+        yref="y2",
+        fillcolor="rgba(27, 67, 50, 0.85)",
+        line=dict(color="rgba(255,255,255,0.2)", width=1),
+        layer="below",
+        row=1,
+        col=2,
+    )
 
     frames = []
     slider_steps = []
@@ -895,47 +1012,82 @@ def build_replay_figure(
             freeze_records_for_event, home_color, away_color
         )
         ball_x, ball_y = infer_ball_position(event, freeze_records_for_event)
+        has_shot = (
+            event.event_type == "Shot"
+            and event.location != (None, None)
+            and event.shot_end_location != (None, None)
+        )
+        if has_shot:
+            shot_x = [event.location[0], event.shot_end_location[0]]
+            shot_y = [event.location[1], event.shot_end_location[1]]
+            shot_line_color = "#ffd700" if event.is_goal else "#ffffaa"
+        else:
+            shot_x = [None]
+            shot_y = [None]
+            shot_line_color = "rgba(0,0,0,0)"
+        frame_data = [
+            home_trace,
+            away_trace,
+            go.Scatter(
+                x=[ball_x] if ball_x is not None else [None],
+                y=[ball_y] if ball_y is not None else [None],
+                mode="markers",
+                marker=dict(
+                    color="#fefefe",
+                    size=16,
+                    line=dict(color="black", width=2),
+                    symbol="circle",
+                ),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            go.Scatter(
+                x=[60],
+                y=[-2],
+                mode="text",
+                text=[build_event_summary(event, teams)],
+                textfont=dict(color="white", size=14),
+                textposition="top center",
+                showlegend=False,
+                hoverinfo="none",
+            ),
+            go.Scatter(
+                x=[0.05],
+                y=[0.9],
+                mode="text",
+                text=[build_scoreboard_text(event, teams)],
+                textfont=dict(color="white", size=15),
+                textposition="top left",
+                showlegend=False,
+                hoverinfo="none",
+            ),
+            go.Scatter(
+                x=[event.match_time_minutes],
+                y=[0],
+                mode="markers",
+                marker=dict(color="#ffff00", size=18, symbol="line-ns-open"),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            go.Scatter(
+                x=shot_x,
+                y=shot_y,
+                mode="lines+markers",
+                line=dict(color=shot_line_color, width=3, dash="dot"),
+                marker=dict(
+                    color=shot_line_color,
+                    size=10,
+                    symbol="circle-open",
+                    line=dict(color=shot_line_color, width=2),
+                ),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+        ]
         frame = go.Frame(
-            data=[
-                home_trace,
-                away_trace,
-                go.Scatter(
-                    x=[ball_x] if ball_x is not None else [None],
-                    y=[ball_y] if ball_y is not None else [None],
-                    mode="markers",
-                    marker=dict(color="#fefefe", size=16, line=dict(color="black", width=2)),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ),
-                go.Scatter(
-                    x=[60],
-                    y=[-5],
-                    mode="text",
-                    text=[build_event_summary(event, teams)],
-                    textfont=dict(color="white", size=14),
-                    showlegend=False,
-                    hoverinfo="none",
-                ),
-                go.Scatter(
-                    x=[0],
-                    y=[0],
-                    mode="text",
-                    text=[build_scoreboard_text(event, teams)],
-                    textfont=dict(color="white", size=14),
-                    showlegend=False,
-                    hoverinfo="none",
-                ),
-                go.Scatter(
-                    x=[event.match_time_minutes],
-                    y=[0],
-                    mode="markers",
-                    marker=dict(color="#ffff00", size=20, symbol="line-ns-open"),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ),
-            ],
+            data=frame_data,
             name=str(idx),
-            traces=[3, 4, 5, 6, 7, 8],
+            traces=dynamic_trace_indices,
         )
         frames.append(frame)
         slider_steps.append(
@@ -947,16 +1099,19 @@ def build_replay_figure(
         )
 
     fig.frames = frames
+    frame_names = [frame.name for frame in frames]
+    default_frame_duration = 420
 
     fig.update_layout(
-        width=1200,
-        height=800,
+        width=1320,
+        height=860,
         showlegend=True,
         legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="white")),
         plot_bgcolor="#0b6623",
         paper_bgcolor="#123524",
         font=dict(color="white"),
         margin=dict(l=40, r=40, t=80, b=40),
+        transition=dict(duration=default_frame_duration, easing="linear"),
         sliders=[
             dict(
                 active=0,
@@ -964,7 +1119,8 @@ def build_replay_figure(
                 pad=dict(t=30),
                 steps=slider_steps,
                 x=0.1,
-                len=0.7,
+                len=0.75,
+                transition=dict(duration=200, easing="linear"),
             )
         ],
         updatemenus=[
@@ -973,14 +1129,52 @@ def build_replay_figure(
                 direction="left",
                 buttons=[
                     dict(
-                        label="Play",
+                        label="⏯ Slow",
                         method="animate",
-                        args=[[frame.name for frame in frames], {"frame": {"duration": 200, "redraw": True}, "fromcurrent": True}],
+                        args=[
+                            frame_names,
+                            {
+                                "frame": {"duration": default_frame_duration * 2, "redraw": True},
+                                "transition": {"duration": default_frame_duration * 2, "easing": "linear"},
+                                "fromcurrent": True,
+                                "mode": "immediate",
+                            },
+                        ],
                     ),
-                    dict(label="Pause", method="animate", args=[[None], {"frame": {"duration": 0}, "mode": "immediate"}]),
+                    dict(
+                        label="▶ Normal",
+                        method="animate",
+                        args=[
+                            frame_names,
+                            {
+                                "frame": {"duration": default_frame_duration, "redraw": True},
+                                "transition": {"duration": default_frame_duration, "easing": "linear"},
+                                "fromcurrent": True,
+                                "mode": "immediate",
+                            },
+                        ],
+                    ),
+                    dict(
+                        label="⏩ Fast",
+                        method="animate",
+                        args=[
+                            frame_names,
+                            {
+                                "frame": {"duration": max(120, default_frame_duration // 2), "redraw": True},
+                                "transition": {"duration": max(120, default_frame_duration // 2), "easing": "linear"},
+                                "fromcurrent": True,
+                                "mode": "immediate",
+                            },
+                        ],
+                    ),
+                    dict(
+                        label="⏸ Pause",
+                        method="animate",
+                        args=[[None], {"frame": {"duration": 0}, "mode": "immediate"}],
+                    ),
                 ],
                 pad=dict(t=30, r=10),
-                x=0.85,
+                x=0.88,
                 y=1.07,
                 bgcolor="#1b4332",
             )
