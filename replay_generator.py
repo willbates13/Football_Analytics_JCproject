@@ -27,10 +27,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 try:
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
-except ModuleNotFoundError as exc:  # pragma: no cover - handled at runtime
-    raise SystemExit(
-        "Plotly is required to run this script. Install it with 'pip install plotly'."
-    ) from exc
+except ModuleNotFoundError:  # pragma: no cover - handled at runtime
+    go = None
+    make_subplots = None
 
 DATA_REPO_URL = "https://raw.githubusercontent.com/statsbomb/open-data/master/data"
 GITHUB_API_THREE_SIXTY = (
@@ -161,6 +160,11 @@ class DataManager:
             raise RuntimeError(f"Failed to fetch {url}: {exc}") from exc
         cache_path.write_text(payload, encoding="utf-8")
         return json.loads(payload)
+
+    def get_competitions(self) -> List[dict]:
+        url = f"{DATA_REPO_URL}/competitions.json"
+        cache_path = self.raw_dir / "competitions.json"
+        return self._fetch_json(url, cache_path)
 
     def get_matches(self, competition_id: int, season_id: int) -> List[dict]:
         url = f"{DATA_REPO_URL}/matches/{competition_id}/{season_id}.json"
@@ -716,6 +720,11 @@ def build_replay_figure(
     teams: Dict[int, TeamInfo],
     match_info: dict,
 ) -> go.Figure:
+    if go is None or make_subplots is None:  # pragma: no cover - runtime dependency
+        raise SystemExit(
+            "Plotly is required to build the replay figure. Install it with 'pip install plotly'."
+        )
+
     freeze_lookup: Dict[str, List[FreezeFrameRecord]] = {}
     for frame in freeze_frames:
         freeze_lookup.setdefault(frame.event_uuid, []).append(frame)
@@ -995,34 +1004,78 @@ def build_replay_figure(
     return fig
 
 
+def build_three_sixty_catalog(manager: DataManager) -> Dict[int, dict]:
+    match_ids = set(manager.list_three_sixty_match_ids())
+    competitions = manager.get_competitions()
+    catalog: Dict[int, dict] = {}
+    remaining = set(match_ids)
+    for competition in competitions:
+        competition_id = competition.get("competition_id")
+        season_id = competition.get("season_id")
+        if competition_id is None or season_id is None:
+            continue
+        matches = manager.get_matches(int(competition_id), int(season_id))
+        for match in matches:
+            match_id = match.get("match_id")
+            if match_id in remaining:
+                catalog[int(match_id)] = {
+                    "match": match,
+                    "competition": competition,
+                    "competition_id": int(competition_id),
+                    "season_id": int(season_id),
+                }
+                remaining.remove(match_id)
+        if not remaining:
+            break
+    return catalog
+
+
 def list_matches_with_three_sixty(
-    manager: DataManager,
-    competition_id: int,
-    season_id: int,
+    catalog: Dict[int, dict],
+    competition_id: Optional[int] = None,
+    season_id: Optional[int] = None,
+    team_query: Optional[str] = None,
 ) -> None:
-    three_sixty_ids = set(manager.list_three_sixty_match_ids())
-    matches = manager.get_matches(competition_id, season_id)
+    team_query_normalised = team_query.lower() if team_query else None
     rows = []
-    for match in matches:
-        match_id = match.get("match_id")
-        if match_id in three_sixty_ids:
-            rows.append(
-                (
-                    match_id,
-                    match.get("match_date"),
-                    match.get("home_team", {}).get("home_team_name"),
-                    match.get("away_team", {}).get("away_team_name"),
-                    match.get("competition_stage", {}).get("name"),
-                )
+    for match_id, entry in catalog.items():
+        comp_id = entry["competition_id"]
+        comp_season = entry["season_id"]
+        if competition_id is not None and comp_id != competition_id:
+            continue
+        if season_id is not None and comp_season != season_id:
+            continue
+        match = entry["match"]
+        home = match.get("home_team", {}).get("home_team_name", "Unknown")
+        away = match.get("away_team", {}).get("away_team_name", "Unknown")
+        if team_query_normalised and team_query_normalised not in home.lower() and team_query_normalised not in away.lower():
+            continue
+        rows.append(
+            (
+                match_id,
+                match.get("match_date"),
+                home,
+                away,
+                match.get("competition_stage", {}).get("name"),
+                entry["competition"].get("competition_name"),
+                entry["competition"].get("season_name"),
             )
+        )
     if not rows:
-        print("No matches with 360 data found for the selected competition/season.")
+        print("No matches with 360 data found that match the given filters.")
         return
-    header = f"{'Match ID':>8}  {'Date':<12}  {'Home':<25}  {'Away':<25}  {'Stage'}"
+    rows.sort(key=lambda item: (item[1] or "", item[0]))
+    header = (
+        f"{'Match ID':>8}  {'Date':<12}  {'Home':<25}  {'Away':<25}  {'Stage':<15}  "
+        f"{'Competition':<25}  {'Season'}"
+    )
     print(header)
     print("-" * len(header))
-    for match_id, date, home, away, stage in rows:
-        print(f"{match_id:>8}  {date:<12}  {home:<25}  {away:<25}  {stage}")
+    for match_id, date, home, away, stage, competition_name, season_name in rows:
+        print(
+            f"{match_id:>8}  {str(date):<12}  {home:<25}  {away:<25}  {str(stage):<15}  "
+            f"{str(competition_name):<25}  {str(season_name)}"
+        )
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -1030,8 +1083,16 @@ def parse_arguments() -> argparse.Namespace:
         description="Generate an interactive replay for a StatsBomb 360 match.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--competition-id", type=int, required=True, help="StatsBomb competition id")
-    parser.add_argument("--season-id", type=int, required=True, help="StatsBomb season id")
+    parser.add_argument(
+        "--competition-id",
+        type=int,
+        help="Optional StatsBomb competition id filter when listing matches",
+    )
+    parser.add_argument(
+        "--season-id",
+        type=int,
+        help="Optional StatsBomb season id filter when listing matches",
+    )
     parser.add_argument("--match-id", type=int, help="StatsBomb match id")
     parser.add_argument(
         "--output",
@@ -1048,7 +1109,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--list-matches",
         action="store_true",
-        help="List all matches with 360 data for the selected competition/season and exit",
+        help="List all matches with 360 data (optionally filtered) and exit",
+    )
+    parser.add_argument(
+        "--team",
+        type=str,
+        help="Filter listed matches by team name (case insensitive substring)",
     )
     return parser.parse_args()
 
@@ -1056,24 +1122,29 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> None:
     args = parse_arguments()
     manager = DataManager(args.data_dir)
+    catalog = build_three_sixty_catalog(manager)
 
     if args.list_matches:
         if args.match_id:
             print("--match-id is ignored when --list-matches is supplied.")
-        list_matches_with_three_sixty(manager, args.competition_id, args.season_id)
+        list_matches_with_three_sixty(
+            catalog,
+            competition_id=args.competition_id,
+            season_id=args.season_id,
+            team_query=args.team,
+        )
         return
 
     if args.match_id is None:
         raise SystemExit("--match-id is required unless --list-matches is used")
 
-    matches = manager.get_matches(args.competition_id, args.season_id)
-    match_info = None
-    for match in matches:
-        if match.get("match_id") == args.match_id:
-            match_info = match
-            break
-    if match_info is None:
-        raise SystemExit("Match not found in the selected competition/season")
+    match_entry = catalog.get(args.match_id)
+    if match_entry is None:
+        raise SystemExit(
+            "Match not found among StatsBomb 360 fixtures. Run with --list-matches to discover available ids."
+        )
+
+    match_info = match_entry["match"]
 
     freeze_data = manager.get_three_sixty(args.match_id)
     if not freeze_data:
