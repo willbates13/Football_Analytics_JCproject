@@ -164,6 +164,50 @@ def discover_three_sixty_matches(
     return summaries
 
 
+def resolve_match_summary(
+    match_id: int, known_matches: Sequence[MatchSummary]
+) -> MatchSummary:
+    """Return metadata for a match that includes StatsBomb 360 data."""
+
+    for summary in known_matches:
+        if summary.match_id == match_id:
+            return summary
+
+    freeze_frames = load_freeze_frames(match_id)
+    if not freeze_frames:
+        raise RuntimeError(
+            f"Match {match_id} does not have StatsBomb 360 data available."
+        )
+
+    target_match: Optional[MatchSummary] = None
+    for competition in load_competitions():
+        comp_id = int(competition["competition_id"])
+        season_id = int(competition["season_id"])
+        matches_meta = load_matches(comp_id, season_id)
+        for match in matches_meta:
+            if int(match["match_id"]) == match_id:
+                target_match = MatchSummary(
+                    competition_id=comp_id,
+                    competition_name=competition.get("competition_name", ""),
+                    season_id=season_id,
+                    season_name=competition.get("season_name", ""),
+                    match_id=match_id,
+                    home_team=match.get("home_team", {}).get("home_team_name", ""),
+                    away_team=match.get("away_team", {}).get("away_team_name", ""),
+                    match_date=match.get("match_date", ""),
+                    freeze_frame_events=sum(1 for frame in freeze_frames.values() if frame),
+                )
+                break
+        if target_match:
+            break
+
+    if target_match is None:
+        raise RuntimeError(
+            "Unable to locate metadata for the requested match, even though 360 data exists."
+        )
+    return target_match
+
+
 def coordinate_to_cell(
     location: Sequence[float], grid_x: int, grid_y: int
 ) -> Optional[Tuple[int, int]]:
@@ -401,21 +445,13 @@ def compute_reward(current_event: dict, next_event: Optional[dict]) -> float:
     return reward
 
 
-def build_value_snapshots(
+def construct_timeline(
     events: List[dict],
     freeze_frames: Dict[str, List[dict]],
     grid_x: int,
     grid_y: int,
-    gamma: float,
-    alpha: float,
-    q_gamma: float,
-    q_alpha: float,
-    epsilon: float,
-    epsilon_decay: float,
-    epsilon_min: float,
-    seed: int,
-) -> List[dict]:
-    """Generate sequential value-grid snapshots for freeze-framed events."""
+):
+    """Return ordered freeze-frame records enriched with plotting context."""
 
     timeline: List[dict] = []
     for event in events:
@@ -452,10 +488,88 @@ def build_value_snapshots(
                 "action": infer_action(event),
             }
         )
+    return timeline
+
+
+def update_q_table_from_timeline(
+    timeline: Sequence[dict],
+    q_table: Dict[Tuple[int, ...], np.ndarray],
+    q_gamma: float,
+    q_alpha: float,
+):
+    """Apply tabular Q-learning updates for the provided timeline."""
+
+    for idx, record in enumerate(timeline):
+        next_record = timeline[idx + 1] if idx + 1 < len(timeline) else None
+        reward = compute_reward(record["event"], next_record["event"] if next_record else None)
+
+        actual_action = record["action"]
+        if actual_action not in ACTION_SPACE:
+            continue
+
+        state_key = record["state_key"]
+        q_values = q_table.setdefault(
+            state_key, np.zeros(len(ACTION_SPACE), dtype=float)
+        )
+
+        next_max = 0.0
+        if next_record is not None:
+            next_state_key = next_record["state_key"]
+            next_q = q_table.setdefault(
+                next_state_key, np.zeros(len(ACTION_SPACE), dtype=float)
+            )
+            next_max = float(np.max(next_q))
+
+        action_index = ACTION_SPACE.index(actual_action)
+        target = reward + q_gamma * next_max
+        q_values[action_index] += q_alpha * (target - q_values[action_index])
+
+
+def pretrain_q_table(
+    timelines: Sequence[Sequence[dict]],
+    q_gamma: float,
+    q_alpha: float,
+    initial_q_table: Optional[Dict[Tuple[int, ...], np.ndarray]] = None,
+):
+    """Warm up the Q-table using the supplied timelines from prior matches."""
+
+    if initial_q_table is not None:
+        q_table = {
+            state: values.copy() for state, values in initial_q_table.items()
+        }
+    else:
+        q_table = {}
+
+    for timeline in timelines:
+        update_q_table_from_timeline(timeline, q_table, q_gamma, q_alpha)
+
+    return q_table
+
+
+def build_value_snapshots(
+    timeline: Sequence[dict],
+    grid_x: int,
+    grid_y: int,
+    gamma: float,
+    alpha: float,
+    q_gamma: float,
+    q_alpha: float,
+    epsilon: float,
+    epsilon_decay: float,
+    epsilon_min: float,
+    seed: int,
+    initial_q_table: Optional[Dict[Tuple[int, ...], np.ndarray]] = None,
+) -> List[dict]:
+    """Generate sequential value-grid snapshots for freeze-framed events."""
 
     value_grid = np.zeros((grid_y, grid_x), dtype=float)
     snapshots: List[dict] = []
-    q_table: Dict[Tuple[int, ...], np.ndarray] = {}
+    if initial_q_table is not None:
+        q_table: Dict[Tuple[int, ...], np.ndarray] = {
+            state: values.copy() for state, values in initial_q_table.items()
+        }
+    else:
+        q_table = {}
     epsilon_value = epsilon
     rng = np.random.default_rng(seed)
 
@@ -937,6 +1051,18 @@ def parse_args() -> argparse.Namespace:
         help="Random seed used for epsilon-greedy exploration.",
     )
     parser.add_argument(
+        "--pretrain-count",
+        type=int,
+        default=0,
+        help="Number of additional matches used to warm up the Q-table before the replay.",
+    )
+    parser.add_argument(
+        "--pretrain-match-id",
+        type=int,
+        action="append",
+        help="Explicit match_id values to pretrain on (can be supplied multiple times).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("three_sixty_markov.html"),
@@ -973,47 +1099,8 @@ def main() -> None:
             )
         return
 
-    target_match: Optional[MatchSummary] = None
     if args.match_id is not None:
-        for summary in matches:
-            if summary.match_id == args.match_id:
-                target_match = summary
-                break
-        if target_match is None:
-            # If the requested match wasn't in the limited search, fetch directly.
-            freeze_frames = load_freeze_frames(args.match_id)
-            if not freeze_frames:
-                raise RuntimeError(
-                    f"Match {args.match_id} does not have StatsBomb 360 data available."
-                )
-            # We need metadata to label the animation; attempt to locate it.
-            for competition in load_competitions():
-                comp_id = int(competition["competition_id"])
-                season_id = int(competition["season_id"])
-                matches_meta = load_matches(comp_id, season_id)
-                for match in matches_meta:
-                    if int(match["match_id"]) == args.match_id:
-                        target_match = MatchSummary(
-                            competition_id=comp_id,
-                            competition_name=competition.get("competition_name", ""),
-                            season_id=season_id,
-                            season_name=competition.get("season_name", ""),
-                            match_id=args.match_id,
-                            home_team=match.get("home_team", {}).get("home_team_name", ""),
-                            away_team=match.get("away_team", {}).get("away_team_name", ""),
-                            match_date=match.get("match_date", ""),
-                            freeze_frame_events=sum(
-                                1 for frame in freeze_frames.values() if frame
-                            ),
-                        )
-                        break
-                if target_match:
-                    break
-            if target_match is None:
-                raise RuntimeError(
-                    "Unable to locate metadata for the requested match, "
-                    "even though 360 data exists."
-                )
+        target_match = resolve_match_summary(args.match_id, matches)
     else:
         if not matches:
             raise RuntimeError(
@@ -1022,7 +1109,55 @@ def main() -> None:
             )
         target_match = matches[0]
 
-    assert target_match is not None
+    pretrain_matches: Dict[int, MatchSummary] = {}
+    if args.pretrain_match_id:
+        for match_id in args.pretrain_match_id:
+            if match_id == target_match.match_id:
+                continue
+            if match_id in pretrain_matches:
+                continue
+            pretrain_matches[match_id] = resolve_match_summary(match_id, matches)
+
+    if args.pretrain_count > 0:
+        for summary in matches:
+            if summary.match_id == target_match.match_id:
+                continue
+            if summary.match_id in pretrain_matches:
+                continue
+            pretrain_matches[summary.match_id] = summary
+            if len(pretrain_matches) >= args.pretrain_count:
+                break
+        if len(pretrain_matches) < args.pretrain_count:
+            print(
+                "Warning: fewer matches were available for pretraining than requested. "
+                "Increase --max-matches or supply explicit --pretrain-match-id values."
+            )
+
+    pretrain_timelines: List[List[dict]] = []
+    if pretrain_matches:
+        print(
+            f"Pretraining Q-table on {len(pretrain_matches)} matches before visualising the target replay."
+        )
+    for match_id, summary in pretrain_matches.items():
+        freeze_frames = load_freeze_frames(match_id)
+        if not freeze_frames:
+            print(f"Skipping match {match_id}: StatsBomb 360 freeze frames are not available.")
+            continue
+        events = load_events(match_id)
+        timeline = construct_timeline(events, freeze_frames, args.grid_x, args.grid_y)
+        if not timeline:
+            print(f"Skipping match {match_id}: no usable freeze frames found.")
+            continue
+        pretrain_timelines.append(timeline)
+
+    pretrained_q: Optional[Dict[Tuple[int, ...], np.ndarray]] = None
+    if pretrain_timelines:
+        pretrained_q = pretrain_q_table(
+            pretrain_timelines,
+            q_gamma=args.q_gamma,
+            q_alpha=args.q_alpha,
+        )
+
     freeze_frames = load_freeze_frames(target_match.match_id)
     if not freeze_frames:
         raise RuntimeError(
@@ -1030,9 +1165,9 @@ def main() -> None:
         )
 
     events = load_events(target_match.match_id)
+    timeline = construct_timeline(events, freeze_frames, args.grid_x, args.grid_y)
     snapshots = build_value_snapshots(
-        events,
-        freeze_frames,
+        timeline,
         grid_x=args.grid_x,
         grid_y=args.grid_y,
         gamma=args.gamma,
@@ -1043,6 +1178,7 @@ def main() -> None:
         epsilon_decay=args.epsilon_decay,
         epsilon_min=args.epsilon_min,
         seed=args.rl_seed,
+        initial_q_table=pretrained_q,
     )
 
     title = (

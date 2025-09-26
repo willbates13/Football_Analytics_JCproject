@@ -51,6 +51,10 @@ The script prints the path to the generated HTML file (default
   the Q-learning policy updates
 * `--epsilon`, `--epsilon-decay`, `--epsilon-min` – configure epsilon-greedy
   exploration for the suggested actions
+* `--pretrain-count` – automatically warm up the Q-table on this many additional
+  matches before rendering the target replay (skipping the target match)
+* `--pretrain-match-id` – specify match IDs manually for pretraining (can be
+  repeated)
 * `--rl-seed` – fix the pseudo-random exploration sequence for reproducibility
 * `--output` – choose a different HTML file name
 
@@ -78,6 +82,9 @@ Q(s, a) ← Q(s, a) + α [r + γ max_a' Q(s', a') − Q(s, a)]
 
 where `α`/`γ` are controlled by `--q-alpha` and `--q-gamma`. Suggested actions in
 the animation come from an epsilon-greedy policy (configurable via
-`--epsilon`, `--epsilon-decay` and `--epsilon-min`). The overlay shows both the
-agent's recommendation and the action that actually happened so you can compare
-policy learning against the real match footage.
+`--epsilon`, `--epsilon-decay` and `--epsilon-min`). If you want stronger
+recommendations, warm up the Q-table across a few matches with
+`--pretrain-count` or `--pretrain-match-id` so the agent has seen more examples
+before the target replay. The overlay shows both the agent's recommendation and
+the action that actually happened so you can compare policy learning against
+the real match footage.
