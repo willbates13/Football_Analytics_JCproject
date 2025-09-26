@@ -38,6 +38,8 @@ CACHE_DIR = Path("statsbomb_cache")
 PITCH_LENGTH = 120.0
 PITCH_WIDTH = 80.0
 
+ACTION_SPACE: Tuple[str, ...] = ("pass", "shoot", "dribble")
+
 
 @dataclass
 class MatchSummary:
@@ -181,6 +183,93 @@ def coordinate_to_cell(
     return y_idx, x_idx
 
 
+def discretise_distance(distance: float, *, bin_size: float = 5.0, max_bin: int = 10) -> int:
+    """Bucket a distance into an integer bin for Q-learning state aggregation."""
+
+    if not np.isfinite(distance):
+        return max_bin + 1
+    bucket = int(distance // bin_size)
+    return min(bucket, max_bin)
+
+
+def count_players_in_grid(
+    freeze_frame: List[dict], grid_x: int, grid_y: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return teammate/opponent occupancy counts for each grid cell."""
+
+    teammates = np.zeros((grid_y, grid_x), dtype=int)
+    opponents = np.zeros((grid_y, grid_x), dtype=int)
+    for player in freeze_frame:
+        cell = coordinate_to_cell(player.get("location"), grid_x, grid_y)
+        if cell is None:
+            continue
+        row, col = cell
+        if player.get("teammate"):
+            teammates[row, col] += 1
+        else:
+            opponents[row, col] += 1
+    return teammates, opponents
+
+
+def nearest_opponent_distance(
+    freeze_frame: List[dict], ball_location: Optional[Sequence[float]]
+) -> float:
+    """Return the Euclidean distance from the ball carrier to the closest opponent."""
+
+    if not ball_location or len(ball_location) < 2:
+        return float("inf")
+
+    bx, by = float(ball_location[0]), float(ball_location[1])
+    min_distance = float("inf")
+    for player in freeze_frame:
+        if player.get("teammate"):
+            continue
+        location = player.get("location")
+        if not location or len(location) < 2:
+            continue
+        px, py = float(location[0]), float(location[1])
+        distance = float(np.hypot(px - bx, py - by))
+        if distance < min_distance:
+            min_distance = distance
+    return min_distance
+
+
+def summarise_state(
+    freeze_frame: List[dict],
+    ball_location: Optional[Sequence[float]],
+    grid_x: int,
+    grid_y: int,
+) -> Tuple[Tuple[int, ...], Dict[str, object]]:
+    """Create a discrete state key and human-readable summary for Q-learning."""
+
+    teammate_counts, opponent_counts = count_players_in_grid(freeze_frame, grid_x, grid_y)
+    ball_cell = coordinate_to_cell(ball_location, grid_x, grid_y)
+    nearest_distance = nearest_opponent_distance(freeze_frame, ball_location)
+    distance_bin = discretise_distance(nearest_distance)
+
+    if ball_cell is None:
+        ball_cell = (-1, -1)
+
+    state_key: Tuple[int, ...] = (
+        ball_cell[0],
+        ball_cell[1],
+        distance_bin,
+        *tuple(int(value) for value in teammate_counts.flatten()),
+        *tuple(int(value) for value in opponent_counts.flatten()),
+    )
+
+    summary = {
+        "ball_cell": ball_cell,
+        "nearest_opponent_distance": None
+        if not np.isfinite(nearest_distance)
+        else float(nearest_distance),
+        "teammate_counts": teammate_counts.tolist(),
+        "opponent_counts": opponent_counts.tolist(),
+        "distance_bin": distance_bin,
+    }
+    return state_key, summary
+
+
 def build_context_grid(
     freeze_frame: List[dict],
     ball_location: Optional[Sequence[float]],
@@ -239,6 +328,19 @@ def describe_event(event: dict) -> str:
             extra = " (shot assist)"
 
     return f"{minute:02d}:{second:02d} - {player_name} {event_type}{extra}"
+
+
+def infer_action(event: dict) -> Optional[str]:
+    """Map a StatsBomb event to one of the discrete RL actions."""
+
+    event_type = event.get("type", {}).get("name")
+    if event_type == "Shot":
+        return "shoot"
+    if event_type == "Pass":
+        return "pass"
+    if event_type in {"Carry", "Dribble"}:
+        return "dribble"
+    return None
 
 
 def extract_player_positions(freeze_frame: List[dict]) -> Tuple[List[dict], List[dict]]:
@@ -306,6 +408,12 @@ def build_value_snapshots(
     grid_y: int,
     gamma: float,
     alpha: float,
+    q_gamma: float,
+    q_alpha: float,
+    epsilon: float,
+    epsilon_decay: float,
+    epsilon_min: float,
+    seed: int,
 ) -> List[dict]:
     """Generate sequential value-grid snapshots for freeze-framed events."""
 
@@ -327,6 +435,9 @@ def build_value_snapshots(
             "x": float(ball_location[0]) if ball_location else None,
             "y": float(ball_location[1]) if ball_location else None,
         }
+        state_key, state_summary = summarise_state(
+            freeze_frame, ball_location, grid_x, grid_y
+        )
 
         timeline.append(
             {
@@ -336,11 +447,17 @@ def build_value_snapshots(
                 "teammates": teammates,
                 "opponents": opponents,
                 "ball": ball_point,
+                "state_key": state_key,
+                "state_summary": state_summary,
+                "action": infer_action(event),
             }
         )
 
     value_grid = np.zeros((grid_y, grid_x), dtype=float)
     snapshots: List[dict] = []
+    q_table: Dict[Tuple[int, ...], np.ndarray] = {}
+    epsilon_value = epsilon
+    rng = np.random.default_rng(seed)
 
     for idx, record in enumerate(timeline):
         next_record = timeline[idx + 1] if idx + 1 < len(timeline) else None
@@ -355,6 +472,30 @@ def build_value_snapshots(
 
         value_grid = value_grid + alpha * td_error * context
 
+        state_key = record["state_key"]
+        q_values = q_table.setdefault(state_key, np.zeros(len(ACTION_SPACE), dtype=float))
+        if rng.random() < epsilon_value:
+            suggested_idx = int(rng.integers(0, len(ACTION_SPACE)))
+            explored = True
+        else:
+            suggested_idx = int(np.argmax(q_values))
+            explored = False
+        suggested_action = ACTION_SPACE[suggested_idx]
+
+        next_state_key = next_record["state_key"] if next_record else None
+        next_max = 0.0
+        if next_state_key is not None:
+            next_q = q_table.setdefault(next_state_key, np.zeros(len(ACTION_SPACE), dtype=float))
+            next_max = float(np.max(next_q))
+
+        actual_action = record["action"]
+        if actual_action in ACTION_SPACE:
+            action_index = ACTION_SPACE.index(actual_action)
+            target = reward + q_gamma * next_max
+            q_values[action_index] += q_alpha * (target - q_values[action_index])
+
+        q_snapshot = {action: float(q_values[idx]) for idx, action in enumerate(ACTION_SPACE)}
+
         snapshots.append(
             {
                 "value_grid": value_grid.copy(),
@@ -365,8 +506,15 @@ def build_value_snapshots(
                 "reward": reward,
                 "state_value": state_value,
                 "td_error": td_error,
+                "suggested_action": suggested_action,
+                "actual_action": actual_action,
+                "exploration": explored,
+                "epsilon": float(epsilon_value),
+                "q_values": q_snapshot,
+                "state_summary": record["state_summary"],
             }
         )
+        epsilon_value = max(epsilon_min, epsilon_value * epsilon_decay)
     return snapshots
 
 
@@ -515,6 +663,28 @@ def make_animation(
     slider_steps = []
     for idx, frame in enumerate(snapshots):
         description = frame["description"]
+        nearest_distance = frame["state_summary"].get("nearest_opponent_distance")
+        if nearest_distance is None:
+            nearest_text = "Nearest opponent: not in frame"
+        else:
+            nearest_text = f"Nearest opponent: {nearest_distance:.1f} m"
+        ball_cell = frame["state_summary"].get("ball_cell")
+        behaviour = "explore" if frame["exploration"] else "exploit"
+        actual_action = (
+            frame["actual_action"].title() if frame["actual_action"] else "None"
+        )
+        suggested_action = frame["suggested_action"].title()
+        summary_text = (
+            f"{description}<br>"
+            f"Reward: {frame['reward']:.2f}, TD error: {frame['td_error']:.2f}, "
+            f"State value: {frame['state_value']:.2f}<br>"
+            f"Agent suggestion: {suggested_action} ({behaviour}, ε={frame['epsilon']:.2f}) | "
+            f"Actual: {actual_action}<br>"
+            f"{nearest_text} | Ball cell: {ball_cell}"
+        )
+        q_text = "<br>".join(
+            f"{action.title()}: {frame['q_values'][action]:.2f}" for action in ACTION_SPACE
+        )
         frames.append(
             go.Frame(
                 data=[
@@ -553,10 +723,21 @@ def make_animation(
                             y=1.05,
                             xref="paper",
                             yref="paper",
-                            text=f"{description}<br>Reward: {frame['reward']:.2f}, TD error: {frame['td_error']:.2f}",
+                            text=summary_text,
                             showarrow=False,
                             font=dict(color="white"),
-                        )
+                        ),
+                        dict(
+                            x=1.12,
+                            y=0.5,
+                            xref="paper",
+                            yref="paper",
+                            text=f"Q-values<br>{q_text}",
+                            showarrow=False,
+                            align="left",
+                            bgcolor="rgba(0,0,0,0.6)",
+                            font=dict(color="white"),
+                        ),
                     ]
                 ),
             )
@@ -570,9 +751,26 @@ def make_animation(
         )
 
     fig = go.Figure(data=[heatmap, teammate_trace, opponent_trace, ball_trace], frames=frames)
+    initial_nearest = initial["state_summary"].get("nearest_opponent_distance")
+    if initial_nearest is None:
+        initial_nearest_text = "Nearest opponent: not in frame"
+    else:
+        initial_nearest_text = f"Nearest opponent: {initial_nearest:.1f} m"
+    initial_summary = (
+        f"{initial['description']}<br>"
+        f"Reward: {initial['reward']:.2f}, TD error: {initial['td_error']:.2f}, "
+        f"State value: {initial['state_value']:.2f}<br>"
+        f"Agent suggestion: {initial['suggested_action'].title()} "
+        f"({'explore' if initial['exploration'] else 'exploit'}, ε={initial['epsilon']:.2f}) | "
+        f"Actual: {initial['actual_action'].title() if initial['actual_action'] else 'None'}<br>"
+        f"{initial_nearest_text} | Ball cell: {initial['state_summary'].get('ball_cell')}"
+    )
+    initial_q_text = "<br>".join(
+        f"{action.title()}: {initial['q_values'][action]:.2f}" for action in ACTION_SPACE
+    )
     fig.update_layout(
         title=title,
-        width=1000,
+        width=1150,
         height=650,
         paper_bgcolor="#1b1b1b",
         plot_bgcolor="#1b1b1b",
@@ -597,10 +795,21 @@ def make_animation(
                 y=1.05,
                 xref="paper",
                 yref="paper",
-                text=f"{initial['description']}<br>Reward: {initial['reward']:.2f}, TD error: {initial['td_error']:.2f}",
+                text=initial_summary,
                 showarrow=False,
                 font=dict(color="white"),
-            )
+            ),
+            dict(
+                x=1.12,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                text=f"Q-values<br>{initial_q_text}",
+                showarrow=False,
+                align="left",
+                bgcolor="rgba(0,0,0,0.6)",
+                font=dict(color="white"),
+            ),
         ],
         sliders=[
             {
@@ -635,6 +844,7 @@ def make_animation(
             }
         ],
         legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="white")),
+        margin=dict(l=60, r=240, t=80, b=40),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -689,6 +899,42 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.4,
         help="Learning rate for the temporal-difference update.",
+    )
+    parser.add_argument(
+        "--q-gamma",
+        type=float,
+        default=0.9,
+        help="Discount factor for the Q-learning policy update.",
+    )
+    parser.add_argument(
+        "--q-alpha",
+        type=float,
+        default=0.3,
+        help="Learning rate applied to the Q-learning updates.",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.25,
+        help="Initial exploration rate for the epsilon-greedy policy.",
+    )
+    parser.add_argument(
+        "--epsilon-decay",
+        type=float,
+        default=0.995,
+        help="Multiplicative decay applied to epsilon after each frame.",
+    )
+    parser.add_argument(
+        "--epsilon-min",
+        type=float,
+        default=0.05,
+        help="Lower bound for exploration to retain some stochasticity.",
+    )
+    parser.add_argument(
+        "--rl-seed",
+        type=int,
+        default=42,
+        help="Random seed used for epsilon-greedy exploration.",
     )
     parser.add_argument(
         "--output",
@@ -791,6 +1037,12 @@ def main() -> None:
         grid_y=args.grid_y,
         gamma=args.gamma,
         alpha=args.alpha,
+        q_gamma=args.q_gamma,
+        q_alpha=args.q_alpha,
+        epsilon=args.epsilon,
+        epsilon_decay=args.epsilon_decay,
+        epsilon_min=args.epsilon_min,
+        seed=args.rl_seed,
     )
 
     title = (
