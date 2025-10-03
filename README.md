@@ -15,6 +15,8 @@ surface emerge event by event.
   opponent locations plus the ball position
 * updates the value grid sequentially with a temporal-difference rule so you can
   step through the creation of the Markov value model
+* trains a lightweight Q-learning policy in parallel that suggests pass / shoot /
+  dribble actions for the ball carrier using the same freeze-frame context
 * draws every player and the ball on a stylised pitch alongside the evolving
   value surface
 * saves the result as a Plotly HTML animation where you can scrub through or
@@ -45,8 +47,44 @@ The script prints the path to the generated HTML file (default
   function
 * `--gamma` / `--alpha` – tweak the temporal-difference discount factor and
   learning rate
+* `--q-gamma` / `--q-alpha` – control the discount factor and learning rate for
+  the Q-learning policy updates
+* `--epsilon`, `--epsilon-decay`, `--epsilon-min` – configure epsilon-greedy
+  exploration for the suggested actions
+* `--pretrain-count` – automatically warm up the Q-table on this many additional
+  matches before rendering the target replay (skipping the target match)
+* `--pretrain-match-id` – specify match IDs manually for pretraining (can be
+  repeated)
+* `--rl-seed` – fix the pseudo-random exploration sequence for reproducibility
 * `--output` – choose a different HTML file name
 
 Because the animation is driven entirely by StatsBomb 360 freeze frames, some
 competitions will not appear unless they have that extra contextual data. Use
 `--list` to confirm availability before rendering.
+
+## How the Q-learning demo works
+
+Every freeze-framed event is treated as a reinforcement learning state. The
+state vector is fully derived from the freeze frame: it records the ball
+carrier's grid cell, the number of team-mates and opponents in each grid cell
+and a discretised estimate of the distance to the nearest defender. Actions are
+restricted to the three intuitive decisions visible in the data – pass, shoot
+or dribble (carry).
+
+Rewards stay simple for interpretability: goals are worth `1.0`, shots are
+weighted by their StatsBomb xG, assists receive a positive bonus and losing
+possession incurs a penalty. A tabular Q-learning agent updates on top of the
+observed sequence using:
+
+```
+Q(s, a) ← Q(s, a) + α [r + γ max_a' Q(s', a') − Q(s, a)]
+```
+
+where `α`/`γ` are controlled by `--q-alpha` and `--q-gamma`. Suggested actions in
+the animation come from an epsilon-greedy policy (configurable via
+`--epsilon`, `--epsilon-decay` and `--epsilon-min`). If you want stronger
+recommendations, warm up the Q-table across a few matches with
+`--pretrain-count` or `--pretrain-match-id` so the agent has seen more examples
+before the target replay. The overlay shows both the agent's recommendation and
+the action that actually happened so you can compare policy learning against
+the real match footage.

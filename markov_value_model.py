@@ -38,6 +38,8 @@ CACHE_DIR = Path("statsbomb_cache")
 PITCH_LENGTH = 120.0
 PITCH_WIDTH = 80.0
 
+ACTION_SPACE: Tuple[str, ...] = ("pass", "shoot", "dribble")
+
 
 @dataclass
 class MatchSummary:
@@ -162,6 +164,50 @@ def discover_three_sixty_matches(
     return summaries
 
 
+def resolve_match_summary(
+    match_id: int, known_matches: Sequence[MatchSummary]
+) -> MatchSummary:
+    """Return metadata for a match that includes StatsBomb 360 data."""
+
+    for summary in known_matches:
+        if summary.match_id == match_id:
+            return summary
+
+    freeze_frames = load_freeze_frames(match_id)
+    if not freeze_frames:
+        raise RuntimeError(
+            f"Match {match_id} does not have StatsBomb 360 data available."
+        )
+
+    target_match: Optional[MatchSummary] = None
+    for competition in load_competitions():
+        comp_id = int(competition["competition_id"])
+        season_id = int(competition["season_id"])
+        matches_meta = load_matches(comp_id, season_id)
+        for match in matches_meta:
+            if int(match["match_id"]) == match_id:
+                target_match = MatchSummary(
+                    competition_id=comp_id,
+                    competition_name=competition.get("competition_name", ""),
+                    season_id=season_id,
+                    season_name=competition.get("season_name", ""),
+                    match_id=match_id,
+                    home_team=match.get("home_team", {}).get("home_team_name", ""),
+                    away_team=match.get("away_team", {}).get("away_team_name", ""),
+                    match_date=match.get("match_date", ""),
+                    freeze_frame_events=sum(1 for frame in freeze_frames.values() if frame),
+                )
+                break
+        if target_match:
+            break
+
+    if target_match is None:
+        raise RuntimeError(
+            "Unable to locate metadata for the requested match, even though 360 data exists."
+        )
+    return target_match
+
+
 def coordinate_to_cell(
     location: Sequence[float], grid_x: int, grid_y: int
 ) -> Optional[Tuple[int, int]]:
@@ -179,6 +225,93 @@ def coordinate_to_cell(
     x_idx = int(x / (PITCH_LENGTH / grid_x))
     y_idx = int(y / (PITCH_WIDTH / grid_y))
     return y_idx, x_idx
+
+
+def discretise_distance(distance: float, *, bin_size: float = 5.0, max_bin: int = 10) -> int:
+    """Bucket a distance into an integer bin for Q-learning state aggregation."""
+
+    if not np.isfinite(distance):
+        return max_bin + 1
+    bucket = int(distance // bin_size)
+    return min(bucket, max_bin)
+
+
+def count_players_in_grid(
+    freeze_frame: List[dict], grid_x: int, grid_y: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return teammate/opponent occupancy counts for each grid cell."""
+
+    teammates = np.zeros((grid_y, grid_x), dtype=int)
+    opponents = np.zeros((grid_y, grid_x), dtype=int)
+    for player in freeze_frame:
+        cell = coordinate_to_cell(player.get("location"), grid_x, grid_y)
+        if cell is None:
+            continue
+        row, col = cell
+        if player.get("teammate"):
+            teammates[row, col] += 1
+        else:
+            opponents[row, col] += 1
+    return teammates, opponents
+
+
+def nearest_opponent_distance(
+    freeze_frame: List[dict], ball_location: Optional[Sequence[float]]
+) -> float:
+    """Return the Euclidean distance from the ball carrier to the closest opponent."""
+
+    if not ball_location or len(ball_location) < 2:
+        return float("inf")
+
+    bx, by = float(ball_location[0]), float(ball_location[1])
+    min_distance = float("inf")
+    for player in freeze_frame:
+        if player.get("teammate"):
+            continue
+        location = player.get("location")
+        if not location or len(location) < 2:
+            continue
+        px, py = float(location[0]), float(location[1])
+        distance = float(np.hypot(px - bx, py - by))
+        if distance < min_distance:
+            min_distance = distance
+    return min_distance
+
+
+def summarise_state(
+    freeze_frame: List[dict],
+    ball_location: Optional[Sequence[float]],
+    grid_x: int,
+    grid_y: int,
+) -> Tuple[Tuple[int, ...], Dict[str, object]]:
+    """Create a discrete state key and human-readable summary for Q-learning."""
+
+    teammate_counts, opponent_counts = count_players_in_grid(freeze_frame, grid_x, grid_y)
+    ball_cell = coordinate_to_cell(ball_location, grid_x, grid_y)
+    nearest_distance = nearest_opponent_distance(freeze_frame, ball_location)
+    distance_bin = discretise_distance(nearest_distance)
+
+    if ball_cell is None:
+        ball_cell = (-1, -1)
+
+    state_key: Tuple[int, ...] = (
+        ball_cell[0],
+        ball_cell[1],
+        distance_bin,
+        *tuple(int(value) for value in teammate_counts.flatten()),
+        *tuple(int(value) for value in opponent_counts.flatten()),
+    )
+
+    summary = {
+        "ball_cell": ball_cell,
+        "nearest_opponent_distance": None
+        if not np.isfinite(nearest_distance)
+        else float(nearest_distance),
+        "teammate_counts": teammate_counts.tolist(),
+        "opponent_counts": opponent_counts.tolist(),
+        "distance_bin": distance_bin,
+    }
+    return state_key, summary
 
 
 def build_context_grid(
@@ -241,6 +374,19 @@ def describe_event(event: dict) -> str:
     return f"{minute:02d}:{second:02d} - {player_name} {event_type}{extra}"
 
 
+def infer_action(event: dict) -> Optional[str]:
+    """Map a StatsBomb event to one of the discrete RL actions."""
+
+    event_type = event.get("type", {}).get("name")
+    if event_type == "Shot":
+        return "shoot"
+    if event_type == "Pass":
+        return "pass"
+    if event_type in {"Carry", "Dribble"}:
+        return "dribble"
+    return None
+
+
 def extract_player_positions(freeze_frame: List[dict]) -> Tuple[List[dict], List[dict]]:
     """Return teammate and opponent positions for plotting."""
 
@@ -299,15 +445,13 @@ def compute_reward(current_event: dict, next_event: Optional[dict]) -> float:
     return reward
 
 
-def build_value_snapshots(
+def construct_timeline(
     events: List[dict],
     freeze_frames: Dict[str, List[dict]],
     grid_x: int,
     grid_y: int,
-    gamma: float,
-    alpha: float,
-) -> List[dict]:
-    """Generate sequential value-grid snapshots for freeze-framed events."""
+):
+    """Return ordered freeze-frame records enriched with plotting context."""
 
     timeline: List[dict] = []
     for event in events:
@@ -327,6 +471,9 @@ def build_value_snapshots(
             "x": float(ball_location[0]) if ball_location else None,
             "y": float(ball_location[1]) if ball_location else None,
         }
+        state_key, state_summary = summarise_state(
+            freeze_frame, ball_location, grid_x, grid_y
+        )
 
         timeline.append(
             {
@@ -336,11 +483,95 @@ def build_value_snapshots(
                 "teammates": teammates,
                 "opponents": opponents,
                 "ball": ball_point,
+                "state_key": state_key,
+                "state_summary": state_summary,
+                "action": infer_action(event),
             }
         )
+    return timeline
+
+
+def update_q_table_from_timeline(
+    timeline: Sequence[dict],
+    q_table: Dict[Tuple[int, ...], np.ndarray],
+    q_gamma: float,
+    q_alpha: float,
+):
+    """Apply tabular Q-learning updates for the provided timeline."""
+
+    for idx, record in enumerate(timeline):
+        next_record = timeline[idx + 1] if idx + 1 < len(timeline) else None
+        reward = compute_reward(record["event"], next_record["event"] if next_record else None)
+
+        actual_action = record["action"]
+        if actual_action not in ACTION_SPACE:
+            continue
+
+        state_key = record["state_key"]
+        q_values = q_table.setdefault(
+            state_key, np.zeros(len(ACTION_SPACE), dtype=float)
+        )
+
+        next_max = 0.0
+        if next_record is not None:
+            next_state_key = next_record["state_key"]
+            next_q = q_table.setdefault(
+                next_state_key, np.zeros(len(ACTION_SPACE), dtype=float)
+            )
+            next_max = float(np.max(next_q))
+
+        action_index = ACTION_SPACE.index(actual_action)
+        target = reward + q_gamma * next_max
+        q_values[action_index] += q_alpha * (target - q_values[action_index])
+
+
+def pretrain_q_table(
+    timelines: Sequence[Sequence[dict]],
+    q_gamma: float,
+    q_alpha: float,
+    initial_q_table: Optional[Dict[Tuple[int, ...], np.ndarray]] = None,
+):
+    """Warm up the Q-table using the supplied timelines from prior matches."""
+
+    if initial_q_table is not None:
+        q_table = {
+            state: values.copy() for state, values in initial_q_table.items()
+        }
+    else:
+        q_table = {}
+
+    for timeline in timelines:
+        update_q_table_from_timeline(timeline, q_table, q_gamma, q_alpha)
+
+    return q_table
+
+
+def build_value_snapshots(
+    timeline: Sequence[dict],
+    grid_x: int,
+    grid_y: int,
+    gamma: float,
+    alpha: float,
+    q_gamma: float,
+    q_alpha: float,
+    epsilon: float,
+    epsilon_decay: float,
+    epsilon_min: float,
+    seed: int,
+    initial_q_table: Optional[Dict[Tuple[int, ...], np.ndarray]] = None,
+) -> List[dict]:
+    """Generate sequential value-grid snapshots for freeze-framed events."""
 
     value_grid = np.zeros((grid_y, grid_x), dtype=float)
     snapshots: List[dict] = []
+    if initial_q_table is not None:
+        q_table: Dict[Tuple[int, ...], np.ndarray] = {
+            state: values.copy() for state, values in initial_q_table.items()
+        }
+    else:
+        q_table = {}
+    epsilon_value = epsilon
+    rng = np.random.default_rng(seed)
 
     for idx, record in enumerate(timeline):
         next_record = timeline[idx + 1] if idx + 1 < len(timeline) else None
@@ -355,6 +586,30 @@ def build_value_snapshots(
 
         value_grid = value_grid + alpha * td_error * context
 
+        state_key = record["state_key"]
+        q_values = q_table.setdefault(state_key, np.zeros(len(ACTION_SPACE), dtype=float))
+        if rng.random() < epsilon_value:
+            suggested_idx = int(rng.integers(0, len(ACTION_SPACE)))
+            explored = True
+        else:
+            suggested_idx = int(np.argmax(q_values))
+            explored = False
+        suggested_action = ACTION_SPACE[suggested_idx]
+
+        next_state_key = next_record["state_key"] if next_record else None
+        next_max = 0.0
+        if next_state_key is not None:
+            next_q = q_table.setdefault(next_state_key, np.zeros(len(ACTION_SPACE), dtype=float))
+            next_max = float(np.max(next_q))
+
+        actual_action = record["action"]
+        if actual_action in ACTION_SPACE:
+            action_index = ACTION_SPACE.index(actual_action)
+            target = reward + q_gamma * next_max
+            q_values[action_index] += q_alpha * (target - q_values[action_index])
+
+        q_snapshot = {action: float(q_values[idx]) for idx, action in enumerate(ACTION_SPACE)}
+
         snapshots.append(
             {
                 "value_grid": value_grid.copy(),
@@ -365,8 +620,15 @@ def build_value_snapshots(
                 "reward": reward,
                 "state_value": state_value,
                 "td_error": td_error,
+                "suggested_action": suggested_action,
+                "actual_action": actual_action,
+                "exploration": explored,
+                "epsilon": float(epsilon_value),
+                "q_values": q_snapshot,
+                "state_summary": record["state_summary"],
             }
         )
+        epsilon_value = max(epsilon_min, epsilon_value * epsilon_decay)
     return snapshots
 
 
@@ -515,6 +777,28 @@ def make_animation(
     slider_steps = []
     for idx, frame in enumerate(snapshots):
         description = frame["description"]
+        nearest_distance = frame["state_summary"].get("nearest_opponent_distance")
+        if nearest_distance is None:
+            nearest_text = "Nearest opponent: not in frame"
+        else:
+            nearest_text = f"Nearest opponent: {nearest_distance:.1f} m"
+        ball_cell = frame["state_summary"].get("ball_cell")
+        behaviour = "explore" if frame["exploration"] else "exploit"
+        actual_action = (
+            frame["actual_action"].title() if frame["actual_action"] else "None"
+        )
+        suggested_action = frame["suggested_action"].title()
+        summary_text = (
+            f"{description}<br>"
+            f"Reward: {frame['reward']:.2f}, TD error: {frame['td_error']:.2f}, "
+            f"State value: {frame['state_value']:.2f}<br>"
+            f"Agent suggestion: {suggested_action} ({behaviour}, ε={frame['epsilon']:.2f}) | "
+            f"Actual: {actual_action}<br>"
+            f"{nearest_text} | Ball cell: {ball_cell}"
+        )
+        q_text = "<br>".join(
+            f"{action.title()}: {frame['q_values'][action]:.2f}" for action in ACTION_SPACE
+        )
         frames.append(
             go.Frame(
                 data=[
@@ -553,10 +837,21 @@ def make_animation(
                             y=1.05,
                             xref="paper",
                             yref="paper",
-                            text=f"{description}<br>Reward: {frame['reward']:.2f}, TD error: {frame['td_error']:.2f}",
+                            text=summary_text,
                             showarrow=False,
                             font=dict(color="white"),
-                        )
+                        ),
+                        dict(
+                            x=1.12,
+                            y=0.5,
+                            xref="paper",
+                            yref="paper",
+                            text=f"Q-values<br>{q_text}",
+                            showarrow=False,
+                            align="left",
+                            bgcolor="rgba(0,0,0,0.6)",
+                            font=dict(color="white"),
+                        ),
                     ]
                 ),
             )
@@ -570,9 +865,26 @@ def make_animation(
         )
 
     fig = go.Figure(data=[heatmap, teammate_trace, opponent_trace, ball_trace], frames=frames)
+    initial_nearest = initial["state_summary"].get("nearest_opponent_distance")
+    if initial_nearest is None:
+        initial_nearest_text = "Nearest opponent: not in frame"
+    else:
+        initial_nearest_text = f"Nearest opponent: {initial_nearest:.1f} m"
+    initial_summary = (
+        f"{initial['description']}<br>"
+        f"Reward: {initial['reward']:.2f}, TD error: {initial['td_error']:.2f}, "
+        f"State value: {initial['state_value']:.2f}<br>"
+        f"Agent suggestion: {initial['suggested_action'].title()} "
+        f"({'explore' if initial['exploration'] else 'exploit'}, ε={initial['epsilon']:.2f}) | "
+        f"Actual: {initial['actual_action'].title() if initial['actual_action'] else 'None'}<br>"
+        f"{initial_nearest_text} | Ball cell: {initial['state_summary'].get('ball_cell')}"
+    )
+    initial_q_text = "<br>".join(
+        f"{action.title()}: {initial['q_values'][action]:.2f}" for action in ACTION_SPACE
+    )
     fig.update_layout(
         title=title,
-        width=1000,
+        width=1150,
         height=650,
         paper_bgcolor="#1b1b1b",
         plot_bgcolor="#1b1b1b",
@@ -597,10 +909,21 @@ def make_animation(
                 y=1.05,
                 xref="paper",
                 yref="paper",
-                text=f"{initial['description']}<br>Reward: {initial['reward']:.2f}, TD error: {initial['td_error']:.2f}",
+                text=initial_summary,
                 showarrow=False,
                 font=dict(color="white"),
-            )
+            ),
+            dict(
+                x=1.12,
+                y=0.5,
+                xref="paper",
+                yref="paper",
+                text=f"Q-values<br>{initial_q_text}",
+                showarrow=False,
+                align="left",
+                bgcolor="rgba(0,0,0,0.6)",
+                font=dict(color="white"),
+            ),
         ],
         sliders=[
             {
@@ -635,6 +958,7 @@ def make_animation(
             }
         ],
         legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color="white")),
+        margin=dict(l=60, r=240, t=80, b=40),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -691,6 +1015,54 @@ def parse_args() -> argparse.Namespace:
         help="Learning rate for the temporal-difference update.",
     )
     parser.add_argument(
+        "--q-gamma",
+        type=float,
+        default=0.9,
+        help="Discount factor for the Q-learning policy update.",
+    )
+    parser.add_argument(
+        "--q-alpha",
+        type=float,
+        default=0.3,
+        help="Learning rate applied to the Q-learning updates.",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.25,
+        help="Initial exploration rate for the epsilon-greedy policy.",
+    )
+    parser.add_argument(
+        "--epsilon-decay",
+        type=float,
+        default=0.995,
+        help="Multiplicative decay applied to epsilon after each frame.",
+    )
+    parser.add_argument(
+        "--epsilon-min",
+        type=float,
+        default=0.05,
+        help="Lower bound for exploration to retain some stochasticity.",
+    )
+    parser.add_argument(
+        "--rl-seed",
+        type=int,
+        default=42,
+        help="Random seed used for epsilon-greedy exploration.",
+    )
+    parser.add_argument(
+        "--pretrain-count",
+        type=int,
+        default=0,
+        help="Number of additional matches used to warm up the Q-table before the replay.",
+    )
+    parser.add_argument(
+        "--pretrain-match-id",
+        type=int,
+        action="append",
+        help="Explicit match_id values to pretrain on (can be supplied multiple times).",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("three_sixty_markov.html"),
@@ -727,47 +1099,8 @@ def main() -> None:
             )
         return
 
-    target_match: Optional[MatchSummary] = None
     if args.match_id is not None:
-        for summary in matches:
-            if summary.match_id == args.match_id:
-                target_match = summary
-                break
-        if target_match is None:
-            # If the requested match wasn't in the limited search, fetch directly.
-            freeze_frames = load_freeze_frames(args.match_id)
-            if not freeze_frames:
-                raise RuntimeError(
-                    f"Match {args.match_id} does not have StatsBomb 360 data available."
-                )
-            # We need metadata to label the animation; attempt to locate it.
-            for competition in load_competitions():
-                comp_id = int(competition["competition_id"])
-                season_id = int(competition["season_id"])
-                matches_meta = load_matches(comp_id, season_id)
-                for match in matches_meta:
-                    if int(match["match_id"]) == args.match_id:
-                        target_match = MatchSummary(
-                            competition_id=comp_id,
-                            competition_name=competition.get("competition_name", ""),
-                            season_id=season_id,
-                            season_name=competition.get("season_name", ""),
-                            match_id=args.match_id,
-                            home_team=match.get("home_team", {}).get("home_team_name", ""),
-                            away_team=match.get("away_team", {}).get("away_team_name", ""),
-                            match_date=match.get("match_date", ""),
-                            freeze_frame_events=sum(
-                                1 for frame in freeze_frames.values() if frame
-                            ),
-                        )
-                        break
-                if target_match:
-                    break
-            if target_match is None:
-                raise RuntimeError(
-                    "Unable to locate metadata for the requested match, "
-                    "even though 360 data exists."
-                )
+        target_match = resolve_match_summary(args.match_id, matches)
     else:
         if not matches:
             raise RuntimeError(
@@ -776,7 +1109,55 @@ def main() -> None:
             )
         target_match = matches[0]
 
-    assert target_match is not None
+    pretrain_matches: Dict[int, MatchSummary] = {}
+    if args.pretrain_match_id:
+        for match_id in args.pretrain_match_id:
+            if match_id == target_match.match_id:
+                continue
+            if match_id in pretrain_matches:
+                continue
+            pretrain_matches[match_id] = resolve_match_summary(match_id, matches)
+
+    if args.pretrain_count > 0:
+        for summary in matches:
+            if summary.match_id == target_match.match_id:
+                continue
+            if summary.match_id in pretrain_matches:
+                continue
+            pretrain_matches[summary.match_id] = summary
+            if len(pretrain_matches) >= args.pretrain_count:
+                break
+        if len(pretrain_matches) < args.pretrain_count:
+            print(
+                "Warning: fewer matches were available for pretraining than requested. "
+                "Increase --max-matches or supply explicit --pretrain-match-id values."
+            )
+
+    pretrain_timelines: List[List[dict]] = []
+    if pretrain_matches:
+        print(
+            f"Pretraining Q-table on {len(pretrain_matches)} matches before visualising the target replay."
+        )
+    for match_id, summary in pretrain_matches.items():
+        freeze_frames = load_freeze_frames(match_id)
+        if not freeze_frames:
+            print(f"Skipping match {match_id}: StatsBomb 360 freeze frames are not available.")
+            continue
+        events = load_events(match_id)
+        timeline = construct_timeline(events, freeze_frames, args.grid_x, args.grid_y)
+        if not timeline:
+            print(f"Skipping match {match_id}: no usable freeze frames found.")
+            continue
+        pretrain_timelines.append(timeline)
+
+    pretrained_q: Optional[Dict[Tuple[int, ...], np.ndarray]] = None
+    if pretrain_timelines:
+        pretrained_q = pretrain_q_table(
+            pretrain_timelines,
+            q_gamma=args.q_gamma,
+            q_alpha=args.q_alpha,
+        )
+
     freeze_frames = load_freeze_frames(target_match.match_id)
     if not freeze_frames:
         raise RuntimeError(
@@ -784,13 +1165,20 @@ def main() -> None:
         )
 
     events = load_events(target_match.match_id)
+    timeline = construct_timeline(events, freeze_frames, args.grid_x, args.grid_y)
     snapshots = build_value_snapshots(
-        events,
-        freeze_frames,
+        timeline,
         grid_x=args.grid_x,
         grid_y=args.grid_y,
         gamma=args.gamma,
         alpha=args.alpha,
+        q_gamma=args.q_gamma,
+        q_alpha=args.q_alpha,
+        epsilon=args.epsilon,
+        epsilon_decay=args.epsilon_decay,
+        epsilon_min=args.epsilon_min,
+        seed=args.rl_seed,
+        initial_q_table=pretrained_q,
     )
 
     title = (
