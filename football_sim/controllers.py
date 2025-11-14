@@ -6,7 +6,7 @@ from typing import Dict, Iterable
 
 import numpy as np
 
-from .constants import GOAL, PHYSICS, PITCH
+from .constants import PITCH
 from .entities import Ball, Player, SimulationState
 from .physics import clamp_vector
 
@@ -18,6 +18,8 @@ class PlayerAction:
 
     @staticmethod
     def idle() -> "PlayerAction":
+        # Kicks are intentionally unused in the basic model but retained so the
+        # interface can evolve without breaking callers.
         return PlayerAction(acceleration=np.zeros(2), kick=np.zeros(2))
 
 
@@ -32,11 +34,6 @@ class SimplePolicy:
         ball = state.ball
         players = state.players
 
-        if ball.owner:
-            owner = players[ball.owner]
-            kick_vector = self._attempt_shot(owner, ball)
-            if np.linalg.norm(kick_vector) > 0:
-                actions[owner.identifier] = PlayerAction(np.zeros(2), kick_vector)
         for pid in player_ids:
             player = players[pid]
             desired_velocity = self._desired_velocity(player, ball)
@@ -64,11 +61,3 @@ class SimplePolicy:
         delta_v = desired_velocity - player.velocity
         delta_v = clamp_vector(delta_v, player.max_acceleration)
         return delta_v
-
-    def _attempt_shot(self, player: Player, ball: Ball) -> np.ndarray:
-        distance_to_goal = abs(ball.position[0] - self.attacking_goal_x)
-        centered = abs(ball.position[1] - PITCH.width / 2) < GOAL.width / 2
-        if distance_to_goal < 20 and centered:
-            direction = np.array([np.sign(self.attacking_goal_x - ball.position[0]), 0.0])
-            return direction * PHYSICS.ball_kick_speed
-        return np.zeros(2)

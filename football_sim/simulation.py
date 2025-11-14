@@ -9,7 +9,7 @@ import numpy as np
 from .constants import GOAL, PHYSICS, PITCH, TIMING
 from .controllers import PlayerAction, SimplePolicy
 from .entities import Ball, Player, SimulationState, SimulationStats, Team
-from .physics import apply_ball_physics, integrate_motion
+from .physics import integrate_motion
 
 
 @dataclass
@@ -44,10 +44,10 @@ class FootballSimulation:
             player.position = anchor + np.random.uniform(-5, 5, size=2)
             player.velocity = np.zeros(2)
             player.stamina = 1.0
-        self.ball.owner = np.random.choice(list(self.players))
-        self.players[self.ball.owner].position = self.ball.position.copy()
+        self.ball.owner = None
         self.stats = SimulationStats(score={"home": 0, "away": 0})
         self.history.clear()
+        self._record_state()
 
     def run(self) -> SimulationStats:
         steps = int(self.config.duration / self.dt)
@@ -56,17 +56,16 @@ class FootballSimulation:
         return self.stats
 
     def step(self) -> SimulationState:
-        self.time += self.dt
-        state = SimulationState(time=self.time, players=self.players, ball=self.ball, stats=self.stats)
-        self.history.append(self._snapshot(state))
+        state_view = SimulationState(time=self.time, players=self.players, ball=self.ball, stats=self.stats)
         actions = {}
-        actions.update(self.home_policy.select_actions(state, [p.identifier for p in self.home_team.players]))
-        actions.update(self.away_policy.select_actions(state, [p.identifier for p in self.away_team.players]))
+        actions.update(self.home_policy.select_actions(state_view, [p.identifier for p in self.home_team.players]))
+        actions.update(self.away_policy.select_actions(state_view, [p.identifier for p in self.away_team.players]))
         self._apply_player_actions(actions)
-        self._update_ball(actions)
-        self._handle_collisions()
+        self._resolve_possession()
+        self._update_ball()
         self._detect_goals()
-        return self.history[-1]
+        self.time += self.dt
+        return self._record_state()
 
     def _apply_player_actions(self, actions: Dict[str, PlayerAction]) -> None:
         for pid, player in self.players.items():
@@ -81,25 +80,26 @@ class FootballSimulation:
             player.position = new_pos
             player.velocity = new_vel
 
-    def _update_ball(self, actions: Dict[str, PlayerAction]) -> None:
-        if self.ball.owner and np.linalg.norm(actions[self.ball.owner].kick) > 0:
-            self.ball.velocity = clamp_speed(actions[self.ball.owner].kick, PHYSICS.ball_kick_speed)
-            self.ball.owner = None
+    def _update_ball(self) -> None:
         if self.ball.owner:
             owner = self.players[self.ball.owner]
             self.ball.position = owner.position.copy()
             self.ball.velocity = owner.velocity.copy()
         else:
-            self.ball.position, self.ball.velocity = apply_ball_physics(self.ball.position, self.ball.velocity, self.dt)
+            self.ball.velocity = np.zeros(2)
 
-    def _handle_collisions(self) -> None:
+    def _resolve_possession(self) -> None:
+        closest_player: Optional[Player] = None
+        closest_distance = PHYSICS.possession_distance
         for player in self.players.values():
-            if self.ball.owner:
-                break
             distance = np.linalg.norm(player.position - self.ball.position)
-            if distance < PHYSICS.possession_distance:
-                self.ball.owner = player.identifier
-                self.ball.velocity = np.zeros(2)
+            if distance <= closest_distance:
+                closest_distance = distance
+                closest_player = player
+        if closest_player:
+            self.ball.owner = closest_player.identifier
+        elif self.ball.owner:
+            self.ball.owner = None
 
     def _detect_goals(self) -> None:
         y = self.ball.position[1]
@@ -118,10 +118,7 @@ class FootballSimulation:
     def _kickoff(self, team: str) -> None:
         self.ball.position = np.array([PITCH.length / 2, PITCH.width / 2])
         self.ball.velocity = np.zeros(2)
-        eligible = [p for p in self.players.values() if p.team == team]
-        taker = np.random.choice(eligible)
-        self.ball.owner = taker.identifier
-        taker.position = self.ball.position.copy()
+        self.ball.owner = None
 
     def _create_team(self, name: str, color: str, num_players: int, start_x: float) -> Team:
         players: List[Player] = []
@@ -129,6 +126,12 @@ class FootballSimulation:
             position = np.array([start_x, (i + 1) / (num_players + 1) * PITCH.width])
             players.append(Player(identifier=f"{name}_{i}", team=name, position=position))
         return Team(name=name, color=color, players=players)
+
+    def _record_state(self) -> SimulationState:
+        current = SimulationState(time=self.time, players=self.players, ball=self.ball, stats=self.stats)
+        snapshot = self._snapshot(current)
+        self.history.append(snapshot)
+        return snapshot
 
     def _snapshot(self, state: SimulationState) -> SimulationState:
         players_copy: Dict[str, Player] = {}
@@ -146,10 +149,3 @@ class FootballSimulation:
         ball_copy = Ball(position=state.ball.position.copy(), velocity=state.ball.velocity.copy(), owner=state.ball.owner)
         stats_copy = SimulationStats(score=state.stats.score.copy(), events=list(state.stats.events))
         return SimulationState(time=state.time, players=players_copy, ball=ball_copy, stats=stats_copy)
-
-
-def clamp_speed(vec: np.ndarray, limit: float) -> np.ndarray:
-    norm = np.linalg.norm(vec)
-    if norm > limit and norm > 0:
-        return vec / norm * limit
-    return vec
