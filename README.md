@@ -1,52 +1,52 @@
-# StatsBomb 360 Markov Chain Visualiser
+# Football Simulation Sandbox
 
-This repository keeps everything in a single Python script that pulls directly
-from [StatsBomb's open data](https://github.com/statsbomb/open-data) and builds a
-transparent Markov decision process (MDP) style value model. Every state uses
-StatsBomb 360 freeze-frame player locations so you can literally watch the value
-surface emerge event by event.
+This repository now contains a barebones but fully functioning football (soccer) simulation
+sandbox that is built entirely from scratch. The aim is to provide a transparent and easily
+extensible environment that can later be used for reinforcement-learning experiments. The
+codebase deliberately avoids dependencies on any 360-snapshot tooling; everything from the
+match engine to the optional visualisation is implemented in simple, object-oriented Python.
 
-## What the script does
+## Key components
 
-* downloads competitions, matches and events until it finds ones with StatsBomb
-  360 freeze frames (no other data sources are used)
-* builds a pitch grid and initialises the value function at zero
-* treats each freeze-framed event as a state whose features are the teammate and
-  opponent locations plus the ball position
-* updates the value grid sequentially with a temporal-difference rule so you can
-  step through the creation of the Markov value model
-* draws every player and the ball on a stylised pitch alongside the evolving
-  value surface
-* saves the result as a Plotly HTML animation where you can scrub through or
-  autoplay the match
-
-## Quick start
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python markov_value_model.py --max-matches 10
+```
+football_sim/
+├── constants.py        # Pitch, physics, and timing values
+├── controllers.py      # Heuristic action selection policies
+├── entities.py         # Data structures for players, ball, teams, and state
+├── physics.py          # Low-level integration helpers
+├── simulation.py       # FootballSimulation orchestrates the environment
+└── visualization.py    # 2D Matplotlib playback of saved states
+run_simulation.py       # CLI entry point for simulations
 ```
 
-The script prints the path to the generated HTML file (default
-`three_sixty_markov.html`). Open it in a browser to step through each event.
+## Running a simulation
 
-## Useful command-line options
+1. Install the dependencies:
 
-* `--list` – show the matches (within the search limits) that include 360 data
-  and exit
-* `--match-id` – render a specific match that is known to have StatsBomb 360
-  freeze frames
-* `--competition-id` / `--season-id` – filter the search to a particular
-  competition and season
-* `--max-matches` – limit how many matches are checked for 360 data (default 5)
-* `--grid-x` / `--grid-y` – control the pitch discretisation used for the value
-  function
-* `--gamma` / `--alpha` – tweak the temporal-difference discount factor and
-  learning rate
-* `--output` – choose a different HTML file name
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-Because the animation is driven entirely by StatsBomb 360 freeze frames, some
-competitions will not appear unless they have that extra contextual data. Use
-`--list` to confirm availability before rendering.
+2. Execute a match:
+
+   ```bash
+   python run_simulation.py --duration 120 --dt 0.1 --players 5 --visualize
+   ```
+
+   Use `--visualize` to open a simple 2D pitch animation. Omitting the flag prints the
+   final score and textual event log instead, which makes headless batch simulations
+   extremely fast.
+
+## Design notes
+
+- **Deterministic physics:** Player movement obeys configurable speed and acceleration
+  limits while the ball follows a simple drag model. The transition function is fully
+  deterministic, making it ideal for RL training loops.
+- **Scripted policies:** The current `SimplePolicy` is intentionally dumb – players chase
+  the ball, dribble towards goal, and occasionally shoot when close enough. Swap it out
+  for learned behaviour as soon as you have an agent ready.
+- **State tracking:** Each `SimulationState` snapshot records the full scene, so you can
+  serialise data, compute rewards, or replay with the visualiser.
+
+Feel free to fork this layout, add logging hooks, richer physics, or reward shaping logic
+to suit your experiments.
